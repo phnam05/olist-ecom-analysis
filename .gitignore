@@ -5,3 +5,12 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+
+# IDE
+.idea/
+
+# Raw dataset files not read by the app (kept locally, not tracked)
+data/olist_geolocation_dataset.csv
+data/olist_products_dataset.csv
+data/olist_sellers_dataset.csv
+data/product_category_name_translation.csv

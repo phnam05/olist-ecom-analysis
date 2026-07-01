@@ -79,10 +79,14 @@ def load_data():
     customers = pd.read_csv(f"{base}/olist_customers_dataset.csv")
     reviews   = pd.read_csv(f"{base}/olist_order_reviews_dataset.csv")
 
+    # Source CSVs store dates as DD-MM-YY (e.g. "07-08-18 15:27"), an Excel-style
+    # re-export. Parsing without an explicit format lets pandas fall back to
+    # month-first, which silently swaps day/month for every date where the day is
+    # <= 12 (~40% of rows) and corrupts every downstream time calculation.
     for col in ['order_purchase_timestamp','order_approved_at',
                 'order_delivered_carrier_date','order_delivered_customer_date',
                 'order_estimated_delivery_date']:
-        orders[col] = pd.to_datetime(orders[col], errors='coerce')
+        orders[col] = pd.to_datetime(orders[col], format='%d-%m-%y %H:%M', errors='coerce')
 
     return orders, payments, items, customers, reviews
 
@@ -106,8 +110,9 @@ late_count    = (delivered_df['order_delivered_customer_date'] >
 late_pct_kpi  = round(100 * late_count / len(delivered_df), 1)
 
 cust_kpi = con.execute("""
-    SELECT customer_unique_id, COUNT(order_id) AS total_orders
+    SELECT customer_unique_id, COUNT(DISTINCT o.order_id) AS total_orders
     FROM orders_tbl o JOIN customers_tbl c ON o.customer_id = c.customer_id
+    WHERE o.order_status = 'delivered'
     GROUP BY customer_unique_id
 """).df()
 returning_rate = round(100 * (cust_kpi['total_orders'] > 1).sum() / len(cust_kpi), 1)
@@ -187,13 +192,21 @@ with tab_eda:
         .properties(height=320)
     )
     st.altair_chart(area, use_container_width=True)
+
+    peak       = monthly.loc[monthly['order_count'].idxmax()]
+    peak_label = peak['month_dt'].strftime('%B %Y')
+    peak_val   = int(peak['order_count'])
+    base_val   = int(monthly[monthly['order_count'] >= 100]['order_count'].iloc[0])
+    growth_x   = peak_val / base_val
+    nov17      = monthly.loc[monthly['month_str'] == '2017-11', 'order_count']
+    oct17      = monthly.loc[monthly['month_str'] == '2017-10', 'order_count']
+    bf_jump    = (nov17.iloc[0] / oct17.iloc[0] - 1) * 100 if len(nov17) and len(oct17) else None
+    bf_txt     = (f", jumping ~{bf_jump:.0f}% over the prior month" if bf_jump else "")
     insight(
-        "Order volume on Olist grew dramatically from just a handful of orders per month in late 2016 to over "
-        "<strong>7,000 orders in a single month by mid-2018</strong> — a roughly 50× increase in under two years. "
-        "The most striking single event is the <strong>Black Friday spike in November 2017</strong>, where volume "
-        "nearly doubled from the previous month before returning to trend. This kind of seasonality is important: "
-        "it means logistics, inventory, and customer support need to be scaled in anticipation of peak periods, "
-        "not in reaction to them."
+        f"Order volume grew more than <strong>{growth_x:.0f}× in under two years</strong> — from a few hundred "
+        f"orders a month in late 2016 to a peak of <strong>~{peak_val:,} in {peak_label}</strong>. "
+        f"That peak is the platform's <strong>Black Friday spike</strong>{bf_txt}, before volume settled back to trend. "
+        "Seasonality like this means logistics and support have to scale <em>ahead</em> of peaks, not react to them."
     )
 
     st.space()
@@ -227,13 +240,17 @@ with tab_eda:
         .properties(height=320)
     )
     st.altair_chart(yoy_chart, use_container_width=True)
+
+    piv       = yoy_agg.pivot(index='month_num', columns='year', values='order_count')
+    all_up    = bool((piv['2018'] > piv['2017']).all())
+    jan_ratio = piv.loc[1, '2018'] / piv.loc[1, '2017']
+    aug_pct   = (piv.loc[8, '2018'] / piv.loc[8, '2017'] - 1) * 100
     insight(
-        "Comparing the same months across both years, <strong>2018 outperformed 2017 in every single month</strong> "
-        "without exception. The gap was modest early in the year (around 20–30% more orders in Jan–Feb) but widened "
-        "significantly by mid-year — by July and August, 2018 was running roughly <strong>50–60% ahead of 2017 volumes</strong>. "
-        "This acceleration suggests the platform was gaining market momentum, not just growing at a steady pace. "
-        "For planning purposes, this means year-on-year comparisons will underestimate true capacity needs if the "
-        "growth curve continued into late 2018."
+        f"2018 outsold 2017 in <strong>{'every month' if all_up else 'most months'} shown</strong>. "
+        f"The gap was widest early in the year — January 2018 handled roughly <strong>{jan_ratio:.0f}× the "
+        f"January 2017 volume</strong> — because the platform was still ramping up in early 2017. "
+        f"It narrowed to about <strong>+{aug_pct:.0f}%</strong> by August as the 2017 base caught up. "
+        "The takeaway is broad-based year-on-year growth rather than a single seasonal blip."
     )
 
     st.space()
@@ -345,15 +362,13 @@ with tab_pay:
             }
         )
 
+    cc_pct = pay_sum.set_index('payment_type').loc['credit_card', 'pct_of_orders']
     insight(
-        "<strong>Credit card is by far the dominant payment method</strong>, used in approximately 74% of all orders "
-        "and generating the highest average order value among all methods. This is not just a preference — it signals "
-        "that customers making larger purchases actively choose credit card, likely because of the installment option "
-        "it offers. <strong>Boleto</strong> (a Brazilian cash voucher system) comes second in volume but has a noticeably "
-        "lower average order value, suggesting it attracts more price-sensitive or lower-income customers who may not "
-        "have access to credit. Vouchers and debit cards together account for a small fraction of orders and likely "
-        "represent promotional transactions or specific use cases. From a business standpoint, protecting and optimising "
-        "the credit card checkout experience is critical — any friction there risks losing the highest-value customers."
+        f"<strong>Credit card dominates</strong> — about <strong>{cc_pct:.0f}% of orders</strong>, and the highest "
+        "average order value of any method. That pairing suggests larger baskets lean on its installment option. "
+        "<strong>Boleto</strong> (a Brazilian cash voucher) is a distant second with a lower average ticket — more "
+        "price-sensitive buyers — while vouchers and debit are a small tail. "
+        "Protecting the credit-card checkout is therefore protecting the highest-value orders."
     )
 
     st.space()
@@ -425,15 +440,16 @@ with tab_pay:
             }
         )
 
+    inst_total = installments['order_count'].sum()
+    pct_1      = 100 * installments.loc[installments['payment_installments'] == 1, 'order_count'].iloc[0] / inst_total
+    avg_1      = installments.loc[installments['payment_installments'] == 1, 'avg_value'].iloc[0]
+    hi_grp     = installments[installments['payment_installments'] >= 6]
+    avg_hi     = (hi_grp['avg_value'] * hi_grp['order_count']).sum() / hi_grp['order_count'].sum()
     insight(
-        "The majority of credit card transactions — roughly <strong>52% — are paid in a single installment</strong>, "
-        "meaning the customer pays the full amount upfront. However, a significant and commercially important segment "
-        "splits their payment across 2 to 5 installments. The chart shows a clear pattern: <strong>the more installments "
-        "a customer chooses, the higher the average order value</strong>. A 1-installment order averages around R$ 120, "
-        "while a 10-installment order averages over R$ 400. This makes intuitive sense — customers only split into many "
-        "installments when the total price is large enough to warrant it. This has a direct business implication: "
-        "offering more flexible installment options (especially 6–12 months) on high-value product categories could "
-        "unlock larger basket sizes that customers otherwise wouldn't commit to paying upfront."
+        f"About <strong>{pct_1:.0f}% of credit-card orders are paid in a single installment</strong> (full amount "
+        f"upfront). But order value climbs steeply as installments rise: ~R$ {avg_1:,.0f} at one installment versus "
+        f"~R$ {avg_hi:,.0f} across six-plus. Customers only split payments when the ticket is large — so flexible "
+        "6–12-month terms on high-value categories can unlock bigger baskets they wouldn't commit to paying upfront."
     )
 
 
@@ -538,14 +554,12 @@ with tab_del:
         st.altair_chart(line_dist, use_container_width=True)
 
     insight(
-        f"Late deliveries hurt customer satisfaction significantly and measurably. "
-        f"On-time orders average around <strong>{on_score:.2f} stars</strong>, while late orders drop to just "
-        f"<strong>{lt_score:.2f} stars</strong> — a gap of nearly 1.5 points on a 5-point scale. "
-        f"What makes this particularly striking is the distribution: it's not that late customers give 4 stars instead of 5. "
-        "The chart on the right shows that <strong>late deliveries produce a massive spike at 1 star</strong>, "
-        "while on-time deliveries skew overwhelmingly toward 5 stars. In other words, a late delivery doesn't just "
-        "mildly disappoint — it frequently triggers an angry response. Angry customers don't just leave bad reviews; "
-        "they don't come back."
+        f"Late deliveries hurt satisfaction measurably. On-time orders average <strong>{on_score:.2f} stars</strong> "
+        f"versus just <strong>{lt_score:.2f}</strong> for late ones — a gap of about "
+        f"<strong>{on_score - lt_score:.1f} points</strong> on a 5-point scale. "
+        "And it isn't a mild dip: the distribution on the right shows late deliveries produce a "
+        "<strong>spike at 1 star</strong>, while on-time orders skew hard toward 5. A late delivery frequently "
+        "triggers an angry review — and those customers rarely come back."
     )
 
     st.space()
@@ -640,14 +654,13 @@ with tab_del:
                 "for very late orders. Churn rate (not returning to buy again) is a better measure of harm in this bucket."
             )
 
+    sc_on  = dls['avg_score'].iloc[0]
+    sc_814 = dls['avg_score'].iloc[-2]
     insight(
-        "The drop in satisfaction as deliveries get later follows a clear and steep progression. "
-        "On-time orders score around <strong>4.2 stars</strong>. By 1–3 days late, this drops noticeably. "
-        "By 8–14 days late, the average score falls below 2.5 — more than half the possible satisfaction is lost "
-        "simply because of a delay. "
-        "The business implication is direct: <strong>every day of delay costs customer satisfaction</strong>, "
-        "and the damage is not linear — it accelerates. The difference between 1 day late and 7 days late "
-        "is far more damaging than the difference between 0 and 1 day late."
+        f"The satisfaction drop steepens with delay. On-time orders sit at <strong>{sc_on:.2f} stars</strong>; "
+        f"by 8–14 days late the average collapses to <strong>{sc_814:.2f}</strong> — well under half the scale. "
+        "The damage is non-linear: going from 1 to 7 days late costs far more than going from 0 to 1. "
+        "<strong>Every extra day compounds.</strong>"
     )
 
     st.space()
@@ -690,11 +703,16 @@ with tab_del:
     ontime_scores = delivery_df[delivery_df['delivery_status'] == 'On Time']['review_score']
     late_scores   = delivery_df[delivery_df['delivery_status'] == 'Late']['review_score']
     u_stat, p_val = stats.mannwhitneyu(ontime_scores, late_scores, alternative='greater')
-    effect_size   = 1 - (2 * u_stat) / (len(ontime_scores) * len(late_scores))  # rank-biserial r
+    n1, n2        = len(ontime_scores), len(late_scores)
+    effect_size   = (2 * u_stat) / (n1 * n2) - 1  # rank-biserial r (+ = on-time ranks higher)
+    abs_r         = abs(effect_size)
+    eff_label     = ("large" if abs_r >= 0.5 else "medium" if abs_r >= 0.3
+                     else "small" if abs_r >= 0.1 else "negligible")
+    p_disp        = "< 1e-300" if p_val == 0 else f"{p_val:.2e}"
 
     col_t1, col_t2, col_t3 = st.columns(3)
     col_t1.metric("U Statistic",      f"{u_stat:,.0f}")
-    col_t2.metric("p-value",          f"{p_val:.2e}")
+    col_t2.metric("p-value",          p_disp)
     col_t3.metric("Effect Size (r)",  f"{effect_size:.3f}")
 
     st.markdown("""
@@ -709,22 +727,20 @@ with tab_del:
       A p-value of 0.05 means 5% chance — borderline. A p-value of 0.001 means 0.1% chance — very strong. 
       Our result here is astronomically small, essentially **zero**. This gap is not noise.
 
-    - **Effect size (r)** tells you not just *whether* the difference is real, but *how big* it is in 
-      practical terms. The rank-biserial r ranges from 0 (no difference) to 1 (complete separation). 
-      Conventional thresholds: 0.1 = small, 0.3 = medium, 0.5 = large. Our effect size indicates 
-      a **medium-to-large** real-world impact — this is not a technically significant but practically 
-      irrelevant difference. It is genuinely large.
+    - **Effect size (r)** tells you not just *whether* the difference is real, but *how big* it is in
+      practical terms. The rank-biserial r runs from -1 to +1; a positive value means on-time orders
+      rank higher. Conventional thresholds on its magnitude: 0.1 = small, 0.3 = medium, 0.5 = large.
+      Our value sits in the **large** range — not a technically-significant-but-trivial difference,
+      but a genuinely big one.
     """)
 
     if p_val < 0.001:
         insight(
-            f"The Mann-Whitney U test confirms with near-certainty (p = {p_val:.2e}) that the difference in "
-            f"review scores between on-time and late deliveries is <strong>statistically real, not random</strong>. "
-            f"The effect size of r = {effect_size:.3f} classifies this as a medium-to-large effect — meaning the damage "
-            "from late deliveries is not only statistically provable but also practically significant. "
-            "This gives you a strong, data-backed justification for investing in logistics improvements: "
-            "the connection between delivery speed and customer satisfaction is not a feeling or an assumption — "
-            "it is a <strong>mathematically verified fact</strong> in this dataset."
+            f"The Mann-Whitney U test confirms with near-certainty (p = {p_disp}) that the gap in review scores "
+            f"between on-time and late deliveries is <strong>statistically real, not random</strong>. "
+            f"The effect size r = {effect_size:.3f} makes this a <strong>{eff_label}</strong> effect — the damage "
+            "from late deliveries is both statistically provable and practically significant, "
+            "a strong, data-backed case for investing in faster logistics."
         )
 
 
@@ -735,11 +751,13 @@ with tab_del:
 with tab_ret:
     st.space()
     st.subheader("Customer Retention")
-    st.caption("What share of customers return for a second order, and how long does it take?")
+    st.caption("What share of customers return for a second order, and how long does it take? "
+               "Measured on customers with at least one *delivered* order, matching the RFM and churn tabs.")
 
     cust_orders = con.execute("""
-        SELECT c.customer_unique_id, COUNT(o.order_id) AS total_orders
+        SELECT c.customer_unique_id, COUNT(DISTINCT o.order_id) AS total_orders
         FROM orders_tbl o JOIN customers_tbl c ON o.customer_id = c.customer_id
+        WHERE o.order_status = 'delivered'
         GROUP BY c.customer_unique_id
     """).df()
 
@@ -760,6 +778,7 @@ with tab_ret:
                    ROW_NUMBER() OVER (PARTITION BY c.customer_unique_id
                                       ORDER BY o.order_purchase_timestamp) AS order_rank
             FROM orders_tbl o JOIN customers_tbl c ON o.customer_id = c.customer_id
+            WHERE o.order_status = 'delivered'
         ),
         first_second AS (
             SELECT r1.customer_unique_id,
@@ -1181,9 +1200,9 @@ with tab_ml:
         The definition used here is: **a customer churned if they never made a second purchase**. 
         Label 0 = churned (one-time buyer). Label 1 = retained (came back at least once).
 
-        We look only at each customer's *first order*. The features (inputs to the model) all come 
-        from that first order — because in a real business setting, that's all you would know about 
-        a new customer at the moment you're deciding whether to send them a re-engagement offer.
+        We look only at each customer's *first order*, and we score the model **once that first order has been
+        delivered and reviewed** — the natural moment to decide whether to spend on winning the customer back.
+        Every feature below is known by that point; none of it peeks at any later order (which would leak the answer).
 
         **Step 2 — Features used to predict churn:**
 
@@ -1191,9 +1210,9 @@ with tab_ml:
         |---|---|
         | Order value (R$) | How much they spent on their first purchase |
         | Installments | Whether they split the payment (signals commitment) |
-        | Review score | How satisfied they were — a strong signal of intent to return |
+        | Review score | How satisfied they were — intuitive, but a *weak* predictor here (see importances below) |
         | Payment type | Credit card vs. other (credit card users tend to be higher-value) |
-        | Days late | Whether their delivery was late (and by how much) |
+        | Days late | Whether the first delivery was late, and by how much |
 
         **Step 3 — The class imbalance problem:**
 
@@ -1601,37 +1620,50 @@ with tab_rec:
         {
             "Priority": "🔴 High",
             "Area": "Logistics & Delivery",
-            "Finding": f"Late deliveries (affecting {late_pct_kpi}% of orders) reduce avg review scores by ~1.5 points and significantly increase churn probability.",
-            "Action": "Partner with faster regional carriers for top-revenue states. Set internal delivery targets 2 days ahead of customer-facing estimates to build a buffer.",
-            "KPI": "Late delivery rate < 5% | Review score > 4.2",
+            "Finding": f"Late deliveries hit {late_pct_kpi}% of orders and cut review scores by about "
+                       f"{on_score - lt_score:.1f} points ({on_score:.2f} → {lt_score:.2f}) — the single biggest, "
+                       f"statistically confirmed satisfaction lever in the data.",
+            "Action": "Partner with faster regional carriers for top-revenue states, and hold internal delivery "
+                      "targets a couple of days ahead of the customer-facing estimate to build a buffer.",
+            "KPI": "Late delivery rate < 5% | On-time review score > 4.2",
         },
         {
             "Priority": "🔴 High",
             "Area": "Customer Retention",
-            "Finding": "Over 95% of customers never make a second purchase. Median return time for those who do return is ~150 days.",
-            "Action": "Launch a 30-day post-purchase re-engagement email with a personalized discount. Target 'At Risk' RFM segment with win-back campaigns.",
+            "Finding": f"About {100 * one_time / total:.0f}% of customers never place a second delivered order; "
+                       f"those who do return take a median of {median_days} days.",
+            "Action": "Run a post-purchase re-engagement series (day 14 / 30 / 60) with a personalized offer, "
+                      "concentrated in the first 90 days while the customer is still warm.",
             "KPI": "Second-purchase conversion rate | 90-day repeat rate",
         },
         {
             "Priority": "🟡 Medium",
             "Area": "Churn Prediction & Targeting",
-            "Finding": f"The Gradient Boosting model identifies higher-churn-risk customers at AUC ≈ {best_auc:.2f} using only order-level features — a modest, hard-to-improve signal on this dataset.",
-            "Action": "Deploy churn scores in real-time post-purchase. Automatically trigger a coupon for any customer with predicted churn probability > 60%.",
-            "KPI": "Model AUC in production | Coupon redemption rate",
+            "Finding": f"The best model reaches only AUC ≈ {best_auc:.2f} from first-order features — a weak signal, "
+                       f"because {100 * one_time / total:.0f}% of customers never return and the top driver is simply "
+                       f"order value, not satisfaction.",
+            "Action": "Use the churn score to *prioritize* a limited re-engagement budget (target the highest-risk "
+                      "decile), not as a precise filter. A/B test whether the coupon beats an untargeted send.",
+            "KPI": "Incremental repeat rate vs. control | Coupon redemption rate",
         },
         {
             "Priority": "🟡 Medium",
             "Area": "Payment Optimisation",
-            "Finding": "Credit card users (74% of orders) have the highest average order value. Boleto users tend to make smaller, one-time purchases.",
-            "Action": "Offer installment promotions on high-value categories to shift customers from 1-installment to 2–3 installments, increasing basket size.",
+            "Finding": f"Credit card ({cc_pct:.0f}% of orders) carries the highest average ticket, and larger baskets "
+                       f"correlate with more installments — customers split payment when the total is big.",
+            "Action": "Promote installment options on high-value categories to nudge 1-installment buyers toward "
+                      "2–3 installments and lift basket size.",
             "KPI": "Avg order value | Installment adoption rate",
         },
         {
             "Priority": "🟢 Low",
-            "Area": "Champions Programme",
-            "Finding": "Champions and Loyal Customers represent <10% of the base but drive disproportionate revenue.",
-            "Action": "Introduce an exclusive loyalty tier with early access, free shipping, and priority support to reduce churn in this critical segment.",
-            "KPI": "Champions churn rate | Lifetime value of top tier",
+            "Area": "New-Customer Onboarding (Recency Focus)",
+            "Finding": f"RFM frequency carries almost no signal here — ~{one_order_pct:.0f}% of customers have exactly "
+                       f"one order, so the Champions / Loyal / At-Risk tiers are empty. There is no loyal base to "
+                       f"protect yet; only recency separates customers.",
+            "Action": "Redirect spend from loyalty perks (no population) to first-to-second-purchase conversion: "
+                      "an onboarding series and category cross-sell aimed at New Customers before they go cold.",
+            "KPI": "New → repeat conversion | Time-to-second-order",
         },
     ]
 
@@ -1652,9 +1684,10 @@ with tab_rec:
     st.markdown("---")
     st.markdown(
         "##### Methodology Note\n"
-        "All findings are derived from the Olist public dataset (2016–2018). "
+        "All findings are derived from the Olist public dataset (2016–2018); customer-level analysis "
+        "(retention, RFM, churn) is measured on delivered orders. "
         "Statistical claims are supported by Mann-Whitney U tests. "
-        "Predictive model uses Gradient Boosting with 5 behavioural features; "
+        "The predictive model uses Gradient Boosting with 6 first-order features; "
         "production deployment would benefit from additional features (product category, seller region, seasonality). "
         "RFM segmentation uses quintile-based scoring."
     )

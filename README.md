@@ -20,7 +20,7 @@ An interactive Streamlit dashboard for analyzing the Brazilian **Olist e-commerc
 ### 🚚 Delivery & Satisfaction
 - Late vs. on-time delivery impact on review scores
 - Lateness severity bucketing (1–3 days → 15+ days) with average score per bucket
-- **Mann-Whitney U test** confirming the score gap is statistically significant (p < 0.001, effect size r ≈ 0.3)
+- **Mann-Whitney U test** confirming the score gap is statistically significant (p < 0.001, rank-biserial r ≈ 0.55 — a large effect)
 
 ### 🔁 Customer Retention
 - One-time vs. returning customer breakdown
@@ -29,7 +29,7 @@ An interactive Streamlit dashboard for analyzing the Brazilian **Olist e-commerc
 
 ### 🎯 RFM Segmentation
 - Quintile-based Recency, Frequency, and Monetary scoring
-- Six named segments: Champions, Loyal Customers, New Customers, Potential Loyalists, At Risk, Lost
+- Six named segments are defined (Champions, Loyal, New, Potential Loyalists, At Risk, Lost) — but on this dataset only **three populate** (New, Potential Loyalists, Lost), because ~97% of customers have exactly one order, so the Frequency score can't separate anyone. The app surfaces this honestly rather than hiding it.
 - Scatter plot of customer map colored by segment
 
 ### 🤖 Churn Prediction
@@ -56,9 +56,9 @@ An interactive Streamlit dashboard for analyzing the Brazilian **Olist e-commerc
 
 ```
 .
-├── app.py
+├── olist-app.py
 ├── requirements.txt
-├── data/
+├── data/                       # 5 CSVs the app reads (others in the raw dataset are untracked)
 │   ├── olist_orders_dataset.csv
 │   ├── olist_order_payments_dataset.csv
 │   ├── olist_order_items_dataset.csv
@@ -75,8 +75,10 @@ An interactive Streamlit dashboard for analyzing the Brazilian **Olist e-commerc
 git clone <your-repo-url>
 cd <your-repo>
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run olist-app.py
 ```
+
+> **Data note:** the source CSVs store dates in `DD-MM-YY` format (an Excel-style re-export), so the app parses them with an explicit format. Parsing them naively silently swaps day/month for ~40% of rows and corrupts every time-based metric.
 
 ---
 
@@ -88,11 +90,11 @@ streamlit run app.py
 
 ## Key Findings
 
-- Order volume grew ~50× from late 2016 to mid-2018, with a clear Black Friday spike in November 2017
-- Credit cards account for ~74% of transactions and carry the highest average order value
-- Late deliveries drop average review scores by ~1.5 points (4.2 → 2.7), with the effect confirmed statistically
-- Over 95% of customers never make a second purchase — the median return window for those who do is ~150 days
-- Review score at first purchase is the strongest single predictor of churn
+- Order volume grew ~20× from late 2016 to its November 2017 (Black Friday) peak of ~7,500 orders/month
+- Credit cards account for ~75% of transactions and carry the highest average order value
+- Late deliveries (~8% of orders) drop average review scores from **4.29 → 2.57** — a ~1.7-point gap, confirmed by a Mann-Whitney U test (large effect)
+- ~97% of customers never make a second (delivered) purchase — the median return window for those who do is ~75 days
+- Churn is genuinely **low-signal**: the best model reaches only AUC ≈ 0.59, and the strongest predictor is **order value**, not review score (which ranks near the bottom)
 
 ---
 
@@ -101,4 +103,4 @@ streamlit run app.py
 - Cohort analysis by acquisition month
 - Seller-side analytics (top sellers, fulfillment rates)
 - Geographic heatmap by state
-- Additional ML features (product category, seller region) to push AUC above 0.70
+- Additional ML features (product category, seller region) — though churn here is inherently low-signal, so gains would likely be modest
