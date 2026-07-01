@@ -979,7 +979,7 @@ with tab_rfm:
                     MAX(o.order_purchase_timestamp),
                     (SELECT MAX(order_purchase_timestamp) FROM orders_tbl)
                 ) AS recency_days,
-                COUNT(o.order_id)            AS frequency,
+                COUNT(DISTINCT o.order_id)  AS frequency,
                 SUM(p.payment_value)         AS monetary
             FROM orders_tbl o
             JOIN customers_tbl c ON o.customer_id = c.customer_id
@@ -1087,8 +1087,10 @@ with tab_rfm:
         "Each dot below represents one customer, plotted by how recently they last purchased (x-axis) "
         "and how much they spent in total (y-axis), coloured by their RFM segment. "
         "This gives you a visual intuition for where the segments sit relative to each other. "
-        "**Champions** (green) cluster in the top-left: recent buyers who spent a lot. "
-        "**Lost** customers (grey) cluster in the bottom-right: haven't bought in a long time and didn't spend much. "
+        "**New Customers** (blue) sit toward the left — recent buyers, almost all with just a single order. "
+        "**Potential Loyalists** (orange) fall in the middle, and **Lost** customers (grey) sit to the right: "
+        "haven't bought in a long time. Because nearly every customer has exactly one order, the segments "
+        "separate left-to-right by *recency* rather than by frequency. "
         "A random sample of 3,000 customers is shown to keep the chart readable."
     )
 
@@ -1129,24 +1131,31 @@ with tab_rfm:
         }
     )
 
-    champ_pct  = seg_summary[seg_summary['Segment']=='Champions']['% of Base'].values
-    atrisk_pct = seg_summary[seg_summary['Segment']=='At Risk']['% of Base'].values
-    lost_pct   = seg_summary[seg_summary['Segment']=='Lost']['% of Base'].values
-    champ_spend= seg_summary[seg_summary['Segment']=='Champions']['Avg_Monetary'].values
+    seg_pct       = dict(zip(seg_summary['Segment'], seg_summary['% of Base']))
+    present_segs  = set(seg_summary['Segment'])
+    empty_segs    = [s for s in ('Champions', 'Loyal Customers', 'At Risk')
+                     if s not in present_segs]
+    empty_names   = ', '.join(empty_segs) if empty_segs else 'the high-frequency tiers'
+    one_order_pct = 100 * (rfm['frequency'] == 1).mean()
+    new_pct  = seg_pct.get('New Customers', 0.0)
+    pot_pct  = seg_pct.get('Potential Loyalists', 0.0)
+    lost_pct = seg_pct.get('Lost', 0.0)
 
     insight(
-        f"The segmentation reveals a highly skewed customer base. The vast majority of customers fall into "
-        f"<strong>'Lost'</strong> or <strong>'New Customers'</strong> — one-time buyers who either never engaged deeply "
-        f"or have already disengaged. <strong>Champions</strong> — the top tier who buy often, recently, and spend the most "
-        f"— represent only {f'{champ_pct[0]:.1f}' if len(champ_pct) else 'a small'}% of the customer base, "
-        f"yet their average total spend of R$ {f'{champ_spend[0]:,.0f}' if len(champ_spend) else '0'} is likely several times "
-        f"the platform average. This is the classic '80/20 rule' in action: a small group drives disproportionate revenue. "
+        f"On this dataset the rules produce only three populated segments: "
+        f"<strong>New Customers</strong> ({new_pct:.1f}%), <strong>Potential Loyalists</strong> ({pot_pct:.1f}%), "
+        f"and <strong>Lost</strong> ({lost_pct:.1f}%). "
+        f"The frequency-based tiers — <strong>{empty_names}</strong> — come out empty, and that is a property of "
+        f"the data rather than a bug: about {one_order_pct:.0f}% of customers place exactly one order, so the "
+        f"Frequency score is essentially constant for everyone and can never clear the F ≥ 3 / F ≥ 4 thresholds "
+        f"those segments require. With frequency carrying almost no signal, the only dimension that meaningfully "
+        f"separates customers here is <strong>Recency</strong>. "
         f"<br><br>"
-        f"The most commercially urgent group is <strong>'At Risk'</strong>: these are customers who were once frequent buyers "
-        f"(high frequency score) but haven't purchased recently (low recency score). They know the platform, they've trusted "
-        f"it before, and re-engaging them is far cheaper than acquiring a new customer. A targeted win-back campaign — "
-        f"a personalised discount, a 'we miss you' email with product recommendations based on their purchase history — "
-        f"directed at this segment could recover significant lost revenue."
+        f"That reshapes the playbook. There is no genuine 'used to buy often, now lapsed' group to win back, so the "
+        f"priority is recency-driven: reach <strong>New Customers</strong> while they are still warm — a "
+        f"day-14 / 30 / 60 re-engagement nudge — to convert first-time buyers into repeat ones before they drift "
+        f"into <strong>Lost</strong>. Winning back the Lost segment is far more expensive and rarely pays off, so it "
+        f"is the lowest-priority group, not the highest."
     )
 
 
@@ -1188,10 +1197,10 @@ with tab_ml:
 
         **Step 3 — The class imbalance problem:**
 
-        Approximately **95% of customers never return**. This creates a severe imbalance: 
-        for every 1 retained customer, there are ~19 churned customers. A naive model will simply 
-        predict "churned" for everyone and be 95% accurate — but completely useless, because it never 
-        identifies anyone worth targeting. This is the same problem that appears in fraud detection 
+        Approximately **97% of customers never return**. This creates a severe imbalance:
+        for every 1 retained customer, there are roughly 32 churned customers. A naive model will simply
+        predict "churned" for everyone and be ~97% accurate — but completely useless, because it never
+        identifies anyone worth targeting. This is the same problem that appears in fraud detection
         (99% of transactions are legitimate) and disease diagnosis (most patients are healthy).
 
         We test **two strategies** to fix this, explained below.
@@ -1202,7 +1211,7 @@ with tab_ml:
         **Approach 1 — Class Weighting (`class_weight='balanced'`)**
 
         Instead of changing the data, we change how the model *learns from it*. We tell the model: 
-        "a mistake on a retained customer is 19× more costly than a mistake on a churned customer." 
+        "a mistake on a retained customer is ~32× more costly than a mistake on a churned customer."
         The model then works harder to correctly identify the minority class. No data is thrown away — 
         the model just penalises minority-class errors more heavily during training.
 
@@ -1220,58 +1229,71 @@ with tab_ml:
 
         ✅ Creates a truly balanced training set  
         ✅ Sometimes produces better recall on the minority class  
-        ⚠️ Throws away real data — we discard ~90% of churned customer records  
+        ⚠️ Throws away real data — we discard ~97% of churned customer records
         ⚠️ Works best when the majority class is very large (millions of records). In our case, 
         after undersampling we only train on ~4,000–6,000 total records, which may limit model quality.
 
         **The fraud detection comparison:** In fraud datasets with millions of transactions, 
         undersampling is extremely effective because even after discarding 90% of non-fraud cases, 
-        you still have tens of thousands of them — more than enough. In our dataset, we have ~95,000 
-        customers but only ~4,700 returning ones. Undersampling brings us down to ~9,400 total 
-        training records, which is quite small. Class weighting tends to win here, but we show both 
+        you still have tens of thousands of them — more than enough. In our dataset, we have ~93,000
+        customers but only ~2,800 returning ones. Undersampling brings us down to ~5,600 total
+        training records, which is quite small. Class weighting tends to win here, but we show both
         so you can compare directly.
         """)
 
     @st.cache_data
     def build_ml_dataset():
         df = con.execute("""
-            WITH customer_orders AS (
+            WITH pay AS (
+                SELECT
+                    order_id,
+                    SUM(payment_value)                                           AS payment_value,
+                    MAX(payment_installments)                                    AS payment_installments,
+                    MAX(CASE WHEN payment_type = 'credit_card' THEN 1 ELSE 0 END) AS is_credit_card
+                FROM payments_tbl
+                GROUP BY order_id
+            ),
+            rev AS (
+                SELECT order_id, AVG(review_score) AS review_score
+                FROM reviews_tbl
+                GROUP BY order_id
+            ),
+            customer_orders AS (
                 SELECT
                     c.customer_unique_id,
                     o.order_id,
                     o.order_purchase_timestamp,
                     o.order_delivered_customer_date,
                     o.order_estimated_delivery_date,
-                    o.order_status,
-                    p.payment_value,
-                    p.payment_type,
-                    p.payment_installments,
-                    r.review_score,
+                    pay.payment_value,
+                    pay.payment_installments,
+                    pay.is_credit_card,
+                    rev.review_score,
                     EXTRACT(month FROM o.order_purchase_timestamp) AS purchase_month,
                     ROW_NUMBER() OVER (
                         PARTITION BY c.customer_unique_id
                         ORDER BY o.order_purchase_timestamp
                     ) AS order_rank,
-                    COUNT(*) OVER (PARTITION BY c.customer_unique_id) AS total_orders
+                    COUNT(DISTINCT o.order_id) OVER (PARTITION BY c.customer_unique_id) AS total_orders
                 FROM orders_tbl o
                 JOIN customers_tbl c  ON o.customer_id = c.customer_id
-                JOIN payments_tbl  p  ON o.order_id    = p.order_id
-                LEFT JOIN reviews_tbl r ON o.order_id  = r.order_id
+                JOIN pay              ON o.order_id    = pay.order_id
+                LEFT JOIN rev         ON o.order_id    = rev.order_id
                 WHERE o.order_status = 'delivered'
             )
             SELECT
                 customer_unique_id,
                 payment_value,
                 payment_installments,
-                COALESCE(review_score, 3)                              AS review_score,
-                CASE WHEN payment_type = 'credit_card' THEN 1 ELSE 0 END AS is_credit_card,
+                COALESCE(review_score, 3)                    AS review_score,
+                is_credit_card,
                 CASE
                     WHEN order_delivered_customer_date > order_estimated_delivery_date
                     THEN DATEDIFF('day', order_estimated_delivery_date, order_delivered_customer_date)
                     ELSE 0
-                END                                                    AS days_late,
+                END                                          AS days_late,
                 purchase_month,
-                CASE WHEN total_orders > 1 THEN 1 ELSE 0 END          AS label
+                CASE WHEN total_orders > 1 THEN 1 ELSE 0 END AS label
             FROM customer_orders
             WHERE order_rank = 1
         """).df()
@@ -1551,15 +1573,18 @@ with tab_ml:
 
     best_auc = max(v['auc'] for v in results.values())
     best_model_name = [k for k, v in results.items() if v['auc'] == best_auc][0].replace('\n', ' ')
+    top_feats   = feat_imp['Feature'].tolist()
+    retain_rate = 100 * ml_df['label'].mean()
     insight(
         f"The best-performing model is <strong>{best_model_name}</strong> with an AUC of <strong>{best_auc:.3f}</strong>. "
-        "Review score is the strongest single predictor of whether a customer will return — a dissatisfied customer "
-        "(1–2 stars) is far more likely to churn than one who gave 4–5 stars. "
-        "Days late and order value are also meaningful: large, late orders are the most dangerous combination. "
+        f"It relies most on <strong>{top_feats[0]}</strong>, followed by {top_feats[1]} and {top_feats[2]}. "
+        "The signals available at the moment of a first purchase are weak, so predictive power is limited — "
+        "review score, often assumed to drive repeat buying, actually carries relatively little weight here. "
         "<br><br>"
-        "Note on limitations: this model was built on 5 features available at the time of first order. "
+        f"Note on limitations: this model uses 6 features available at the time of first order, and only "
+        f"~{retain_rate:.0f}% of customers ever return — an inherently hard, low-signal problem. "
         "In a production setting, additional signals — product category, seller rating, customer's city, "
-        "whether a review was left at all — would likely push AUC above 0.70. "
+        "whether a review was left at all — could improve performance. "
         "The model should be retrained monthly as new order data accumulates."
     )
 
@@ -1576,7 +1601,7 @@ with tab_rec:
         {
             "Priority": "🔴 High",
             "Area": "Logistics & Delivery",
-            "Finding": f"Late deliveries (affecting {late_pct_kpi}% of orders) reduce avg review scores by ~2 points and significantly increase churn probability.",
+            "Finding": f"Late deliveries (affecting {late_pct_kpi}% of orders) reduce avg review scores by ~1.5 points and significantly increase churn probability.",
             "Action": "Partner with faster regional carriers for top-revenue states. Set internal delivery targets 2 days ahead of customer-facing estimates to build a buffer.",
             "KPI": "Late delivery rate < 5% | Review score > 4.2",
         },
@@ -1590,7 +1615,7 @@ with tab_rec:
         {
             "Priority": "🟡 Medium",
             "Area": "Churn Prediction & Targeting",
-            "Finding": "The Gradient Boosting model identifies high-churn-risk customers at AUC > 0.65 using only order-level features.",
+            "Finding": f"The Gradient Boosting model identifies higher-churn-risk customers at AUC ≈ {best_auc:.2f} using only order-level features — a modest, hard-to-improve signal on this dataset.",
             "Action": "Deploy churn scores in real-time post-purchase. Automatically trigger a coupon for any customer with predicted churn probability > 60%.",
             "KPI": "Model AUC in production | Coupon redemption rate",
         },
